@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OverlayBridge self-test</title>
+<script>
+  // record ready events fired by the bridge script(s) below
+  window.readyEvents = [];
+  window.addEventListener('overlaybridge:ready', e => window.readyEvents.push(e.detail));
+
+  // ?mode=webview2: stand-in for the launcher's window.chrome.webview
+  if (new URLSearchParams(location.search).get('mode') === 'webview2') {
+    const fake = new EventTarget();
+    fake.posted = [];
+    fake.postMessage = msg => fake.posted.push(msg);
+    window.chrome = window.chrome || {};
+    window.chrome.webview = fake;
+  }
+</script>
+<script src="overlay-bridge.js"></script>
+<script>window.firstInstance = window.OverlayBridge;</script>
+<script src="overlay-bridge.js"></script>
+</head>
+<body>
+<pre id="result">running</pre>
+<script>
+(async () => {
+  const B = window.OverlayBridge;
+  const r = {};
+  r.environment = B.getEnvironment();
+  r.version = B.version;
+  r.isAvailable = B.isAvailable();
+  r.sameInstanceAfterDoubleInclude = B === window.firstInstance;
+  r.readyEventCount = window.readyEvents.length;
+  r.oldApiRemoved = B.send === undefined && B.on === undefined;
+  r.hashAfterLoad = location.hash;
+  r.keyLeftInAddressBar = location.href.indexOf('ovbk=') !== -1;
+
+  const msg = { cmd: 'purchase', items: [1, 2], nested: { ok: true } };
+  r.postMessageResult = await B.postMessage(msg);
+  r.postCircular = await (() => { const o = {}; o.self = o; return B.postMessage(o); })();
+
+  const received = [];
+  const listener = e => received.push(e);
+  B.addEventListener('message', listener);
+  B.addEventListener('message', listener);  // duplicate add must be ignored (like EventTarget)
+
+  if (r.environment === 'webview2') {
+    const wv = window.chrome.webview;
+    r.webview2_postedCount = wv.posted.length;
+    r.webview2_postedSameObject = wv.posted[0] === msg;          // passed through, not wrapped/copied
+    const ev = new MessageEvent('message', { data: { cmd: 'notice', text: 'hi' } });
+    wv.dispatchEvent(ev);
+    r.webview2_receivedCount = received.length;
+    r.webview2_receivedOriginalEvent = received[0] === ev;
+    r.webview2_receivedData = received[0] && received[0].data;
+    B.removeEventListener('message', listener);
+    wv.dispatchEvent(new MessageEvent('message', { data: 'after remove' }));
+    r.webview2_removeWorks = received.length === 1;
+  }
+
+  try { B.postMessage = null; } catch (e) {}
+  r.frozen = typeof B.postMessage === 'function' && Object.isFrozen(B);
+  document.getElementById('result').textContent = JSON.stringify(r);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>vanilla - plain page</title>
+<script src="/overlay-bridge.js"></script>
+<script src="/common/test-echo.js"></script>
+</head>
+<body>
+<h1>Vanilla page</h1>
+<p id="status"></p>
+<div style="height:2000px"></div>
+<h2 id="section-3">Section 3</h2>
+<script>
+  // No router: the page itself reads its URL (query + anchor)
+  function update() {
+    var query = {};
+    location.search.replace(/^\?/, '').split('&').filter(Boolean).forEach(function (kv) {
+      var p = kv.split('=');
+      query[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || '');
+    });
+    window.__routerState = { path: location.pathname, query: query, hash: location.hash, id: null };
+    document.getElementById('status').textContent = JSON.stringify(window.__routerState);
+  }
+  window.__testNavigate = function (p) { history.pushState(null, '', p); update(); };
+  window.addEventListener('hashchange', update);
+  update();
+</script>
+</body>
+</html>

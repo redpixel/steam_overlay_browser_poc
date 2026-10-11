@@ -1,0 +1,16 @@
+{
+  "name": "overlay-bridge-tests",
+  "private": true,
+  "type": "module",
+  "description": "Test-only tooling. Nothing here ships with overlay-bridge.js or the native SDK.",
+  "scripts": {
+    "test:unit": "node --test \"unit/*.test.mjs\"",
+    "test:frameworks": "node --test --test-concurrency=1 \"frameworks/*.test.mjs\"",
+    "test:frameworks:dll": "set BRIDGE_IMPL=dll&& node --test --test-concurrency=1 \"frameworks/*.test.mjs\"",
+    "test:webview2": "node --test webview2/webview2.test.mjs"
+  },
+  "devDependencies": {
+    "acorn": "^8.19.0",
+    "playwright": "^1.64.0"
+  }
+}

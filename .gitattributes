@@ -1,0 +1,2 @@
+# The Spacewar patch must keep the SDK's CRLF line endings byte for byte
+*.patch -text

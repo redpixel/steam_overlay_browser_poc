@@ -1,0 +1,1115 @@
+diff --git a/sdk/steamworksexample/OverlayExamples.cpp b/sdk/steamworksexample/OverlayExamples.cpp
+index bfd0b95..37ab932 100644
+--- a/sdk/steamworksexample/OverlayExamples.cpp
++++ b/sdk/steamworksexample/OverlayExamples.cpp
+@@ -8,8 +8,420 @@
+ #include "OverlayExamples.h"
+ #include "BaseMenu.h"
+ #include <math.h>
++#include <stdarg.h>
+ #include <vector>
+ #include <algorithm>
++#ifdef _WIN32
++#include <shlobj.h>
++#pragma comment( lib, "shell32.lib" )
++#pragma comment( lib, "ole32.lib" )
++#endif
++
++// URL opened by the overlay browser test. Can be overridden without rebuilding by putting
++// a URL on the first line of overlay_test_url.txt in the working directory.
++static const char *k_pchDefaultBrowserTestURL = "https://store.steampowered.com/";
++static const char *k_pchBrowserTestURLFile = "overlay_test_url.txt";
++static const char *k_pchBrowserTestLogFile = "overlay_browser_test.log";
++
++// First line of a text file, without surrounding whitespace or a UTF-8 BOM; strDefault when the
++// file is missing or the line is empty
++static std::string ReadFirstLine( const char *pchFile, const std::string &strDefault )
++{
++	std::string strLine;
++	if ( FILE *file = fopen( pchFile, "rt" ) )
++	{
++		char rgchLine[1024] = {};
++		if ( fgets( rgchLine, sizeof( rgchLine ), file ) )
++			strLine = rgchLine;
++		fclose( file );
++	}
++	strLine.erase( strLine.find_last_not_of( " \t\r\n" ) + 1 );
++	strLine.erase( 0, strLine.find_first_not_of( " \t\xEF\xBB\xBF" ) );
++	return strLine.empty() ? strDefault : strLine;
++}
++
++// Pages loaded in the (modal) overlay browser can navigate to e.g. spacewar://close?result=ok
++// and the game gets an OverlayBrowserProtocolNavigation_t instead of the navigation.
++static const char *k_pchBrowserTestProtocol = "spacewar";
++
++//-----------------------------------------------------------------------------
++// OverlayBridge overlay bridge (native SDK PoC): overlay_bridge.dll next to the exe, loaded at run time
++// with ovb_bridge_loader.h (no import library). Without the DLL, or without Steam, the menu just
++// shows that the bridge is off and the game runs as usual.
++// The test page URL is http://127.0.0.1:8766/popup_test.html, or the first line of ovb_test_url.txt.
++//-----------------------------------------------------------------------------
++#ifdef _WIN32
++#include "../../native_bridge/ovb_bridge_loader.h"
++
++namespace
++{
++	const char *k_pchOvbDefaultURL = "http://127.0.0.1:8766/popup_test.html";
++	const char *k_pchOvbURLFile = "ovb_test_url.txt";
++	const char *k_rgpchOvbOrigins[] = { "http://127.0.0.1:8766", "https://store.example.com" };
++
++	OVB_Api g_Ovb;
++	bool g_bOvbReady = false;
++
++	// Test pings (the page answers {cmd:'pong'}). The menu sends k_pchOvbMenuPing. TEST ONLY: the
++	// callback answers a button click with k_pchOvbAutoPing, because on the Steam Deck the popup
++	// closes as soon as the player goes back to the game, so the menu's ping cannot reach it.
++	const char *k_pchOvbMenuPing = "{\"cmd\":\"ping\",\"from\":\"spacewar\",\"text\":\"\xEB\x84\xA4\xEC\x9D\xB4\xED\x8B\xB0\xEB\xB8\x8C\"}";
++	const char *k_pchOvbAutoPing = "{\"cmd\":\"ping\",\"from\":\"spacewar-callback\",\"text\":\"\xEB\x84\xA4\xEC\x9D\xB4\xED\x8B\xB0\xEB\xB8\x8C\"}";
++
++	const char *OvbReasonName( int nReason )
++	{
++		switch ( nReason )
++		{
++		case OVB_CLOSE_NATIVE_REQUEST: return "NATIVE_REQUEST";
++		case OVB_CLOSE_PAGE_REQUEST: return "PAGE_REQUEST";
++		case OVB_CLOSE_CONNECTION_LOST: return "CONNECTION_LOST";
++		case OVB_CLOSE_NEVER_CONNECTED: return "NEVER_CONNECTED";
++		case OVB_CLOSE_SHUTDOWN: return "SHUTDOWN";
++		case OVB_CLOSE_USER_CLOSED: return "USER_CLOSED";
++		default: return "?";
++		}
++	}
++
++	void OVB_CALL OnOvbMessage( uint32_t unPopupId, const char *pchJson, void *pUser )
++	{
++		COverlayExamples *pThis = (COverlayExamples *)pUser;
++		pThis->LogBrowserTest( "[OVB] WEB -> NATIVE popup %u: %s (thread %lu)", unPopupId, pchJson, GetCurrentThreadId() );
++		if ( strstr( pchJson, "\"cmd\":\"button-click\"" ) )
++		{
++			// Reply from inside the callback
++			int nRC = g_Ovb.OVB_PostMessage( unPopupId, k_pchOvbAutoPing );
++			pThis->LogBrowserTest( "[OVB] NATIVE -> WEB popup %u (from the callback): ping -> %d page(s)", unPopupId, nRC );
++		}
++	}
++
++	void OVB_CALL OnOvbClosed( uint32_t unPopupId, OVB_CloseReason eReason, const char *pchPageReason, void *pUser )
++	{
++		( (COverlayExamples *)pUser )->LogBrowserTest( "[OVB] onClosed popup %u: %s (page reason: %s) (thread %lu)", unPopupId,
++			OvbReasonName( eReason ), pchPageReason ? pchPageReason : "-", GetCurrentThreadId() );
++	}
++
++	void OVB_CALL OnOvbOpened( uint32_t unPopupId, uint32_t unParentPopupId, const char *pchURL, void *pUser )
++	{
++		( (COverlayExamples *)pUser )->LogBrowserTest( "[OVB] onOpened popup %u (child of %u): %s (thread %lu)", unPopupId, unParentPopupId,
++			pchURL, GetCurrentThreadId() );
++	}
++}
++#endif
++
++
++//-----------------------------------------------------------------------------
++// Device ID: one UUID per machine and user, shared by every game and kept when a game is
++// uninstalled. Returned if the file exists, created otherwise.
++//  - Windows:              %LOCALAPPDATA%\OverlayBridge\device_id.txt
++//  - Proton / Wine (Deck): every game gets its own Wine prefix (compatdata/<appid>), so AppData
++//                          there is per game and can go away with it. The file goes to the Linux
++//                          home instead (Windows path from wine_get_dos_file_name, so no
++//                          fixed drive letter):
++//                          $XDG_DATA_HOME/OverlayBridge/device_id.txt, default ~/.local/share/OverlayBridge/device_id.txt
++//                          (the same place a native Linux build would use)
++// The file holds the UUID only (lowercase, 8-4-4-4-12). It is written to a temp file and then
++// moved into place without replacing, so two games starting at once end up with the same ID.
++//-----------------------------------------------------------------------------
++#ifdef _WIN32
++namespace
++{
++	const wchar_t *k_pwchDeviceIdFolder = L"OverlayBridge";
++	const wchar_t *k_pwchDeviceIdFile = L"device_id.txt";
++
++	std::string WideToUTF8( const wchar_t *pwch )
++	{
++		int cch = WideCharToMultiByte( CP_UTF8, 0, pwch, -1, NULL, 0, NULL, NULL );
++		std::string str( cch > 0 ? cch - 1 : 0, '\0' );
++		if ( cch > 1 )
++			WideCharToMultiByte( CP_UTF8, 0, pwch, -1, &str[0], cch, NULL, NULL );
++		return str;
++	}
++
++	std::string WideToUTF8( const std::wstring &wstr ) { return WideToUTF8( wstr.c_str() ); }
++
++	std::wstring UTF8ToWide( const std::string &str )
++	{
++		int cch = MultiByteToWideChar( CP_UTF8, 0, str.c_str(), -1, NULL, 0 );
++		std::wstring wstr( cch > 0 ? cch - 1 : 0, L'\0' );
++		if ( cch > 1 )
++			MultiByteToWideChar( CP_UTF8, 0, str.c_str(), -1, &wstr[0], cch );
++		return wstr;
++	}
++
++	bool BIsUUID( const std::string &str )
++	{
++		if ( str.size() != 36 )
++			return false;
++		for ( size_t i = 0; i < str.size(); ++i )
++		{
++			bool bHyphen = i == 8 || i == 13 || i == 18 || i == 23;
++			if ( bHyphen ? str[i] != '-' : !isxdigit( (unsigned char)str[i] ) )
++				return false;
++		}
++		return true;
++	}
++
++	// Random (version 4) UUID
++	std::string NewUUID()
++	{
++		GUID guid;
++		if ( FAILED( CoCreateGuid( &guid ) ) )
++			return std::string();
++		char rgch[37];
++		sprintf_s( rgch, "%08lx-%04hx-%04hx-%02x%02x-%02x%02x%02x%02x%02x%02x", guid.Data1, guid.Data2, guid.Data3,
++			guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7] );
++		return rgch;
++	}
++
++	enum EDeviceIdFile
++	{
++		k_EDeviceIdFile_OK,
++		k_EDeviceIdFile_Missing,
++		k_EDeviceIdFile_Invalid,	// readable, but not a UUID: may be replaced
++		k_EDeviceIdFile_Unreadable,	// could not be read (access denied, held by another program): never replaced
++	};
++
++	// Reads the UUID (lowercase) into *pstrID. A file another program holds open (antivirus, backup)
++	// is retried briefly and is never reported as invalid, so a valid ID is not replaced just
++	// because it could not be read at that moment.
++	EDeviceIdFile ReadDeviceIdFile( const std::wstring &wstrPath, std::string *pstrID, DWORD *pdwError )
++	{
++		HANDLE hFile = INVALID_HANDLE_VALUE;
++		*pdwError = 0;
++		for ( int nTry = 0; nTry < 10 && hFile == INVALID_HANDLE_VALUE; ++nTry )
++		{
++			hFile = CreateFileW( wstrPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL );
++			if ( hFile != INVALID_HANDLE_VALUE )
++				break;
++			*pdwError = GetLastError();
++			if ( *pdwError == ERROR_FILE_NOT_FOUND || *pdwError == ERROR_PATH_NOT_FOUND )
++				return k_EDeviceIdFile_Missing;
++			if ( *pdwError != ERROR_SHARING_VIOLATION && *pdwError != ERROR_LOCK_VIOLATION )
++				return k_EDeviceIdFile_Unreadable;
++			Sleep( 50 );
++		}
++		if ( hFile == INVALID_HANDLE_VALUE )
++			return k_EDeviceIdFile_Unreadable;
++		char rgch[64] = {};
++		DWORD cbRead = 0;
++		BOOL bRead = ReadFile( hFile, rgch, sizeof( rgch ) - 1, &cbRead, NULL );
++		if ( !bRead )
++			*pdwError = GetLastError();
++		CloseHandle( hFile );
++		if ( !bRead )
++			return k_EDeviceIdFile_Unreadable;
++		std::string str( rgch, cbRead );
++		str.erase( str.find_last_not_of( " \t\r\n" ) + 1 );
++		str.erase( 0, str.find_first_not_of( " \t\r\n\xEF\xBB\xBF" ) );
++		std::transform( str.begin(), str.end(), str.begin(), []( char ch ) { return (char)tolower( (unsigned char)ch ); } );
++		if ( !BIsUUID( str ) )
++			return k_EDeviceIdFile_Invalid;
++		*pstrID = str;
++		return k_EDeviceIdFile_OK;
++	}
++
++	// Windows path of the Linux per-user data folder when running under Wine / Proton, else empty.
++	// *pstrUnixDir gets the same folder as a Linux path. *pstrDiag tells which checks passed
++	// (logged, for the Steam Deck).
++	std::wstring LinuxDataDirViaWine( std::string *pstrUnixDir, std::string *pstrDiag )
++	{
++		char rgch[1024];
++		HMODULE hNtdll = GetModuleHandleW( L"ntdll.dll" );
++		bool bWineExport = hNtdll && GetProcAddress( hNtdll, "wine_get_version" );
++		DWORD cchPrefix = GetEnvironmentVariableA( "WINEPREFIX", rgch, sizeof( rgch ) );
++		*pstrDiag = std::string( "wine_get_version=" ) + ( bWineExport ? "yes" : "no" ) + " WINEPREFIX=" + ( cchPrefix ? "set" : "unset" );
++		if ( !bWineExport && cchPrefix == 0 )
++			return std::wstring();	// real Windows
++
++		// Linux home. Wine does not pass HOME on to Windows programs (seen on Proton 11), so try
++		// what it does pass: its own WINEHOMEDIR ("\??\Z:\home\deck"), then WINEPREFIX
++		// (".../home/deck/.local/share/Steam/steamapps/compatdata/<id>/pfx/"), then USER.
++		auto envUnixPath = [&rgch]( const char *pchName ) -> std::string
++		{
++			DWORD cch = GetEnvironmentVariableA( pchName, rgch, sizeof( rgch ) );
++			return cch > 0 && cch < sizeof( rgch ) && rgch[0] == '/' ? std::string( rgch ) : std::string();
++		};
++		std::string strUnixDir = envUnixPath( "XDG_DATA_HOME" );
++		std::string strHome = strUnixDir.empty() ? envUnixPath( "HOME" ) : std::string();
++		const char *pchHomeFrom = "HOME";
++		if ( strUnixDir.empty() && strHome.empty() )
++		{
++			DWORD cch = GetEnvironmentVariableA( "WINEHOMEDIR", rgch, sizeof( rgch ) );
++			std::string str = cch > 0 && cch < sizeof( rgch ) ? rgch : "";
++			size_t nZ = str.find( "Z:\\" );
++			if ( nZ == std::string::npos )
++				nZ = str.find( "z:\\" );
++			if ( nZ != std::string::npos )
++			{
++				strHome = str.substr( nZ + 2 );
++				std::replace( strHome.begin(), strHome.end(), '\\', '/' );
++				pchHomeFrom = "WINEHOMEDIR";
++			}
++		}
++		if ( strUnixDir.empty() && strHome.empty() )
++		{
++			std::string strPrefix = envUnixPath( "WINEPREFIX" );
++			size_t nShare = strPrefix.find( "/.local/share/" );
++			if ( nShare != std::string::npos && nShare > 0 )
++			{
++				strHome = strPrefix.substr( 0, nShare );
++				pchHomeFrom = "WINEPREFIX";
++			}
++		}
++		if ( strUnixDir.empty() && strHome.empty() )
++		{
++			DWORD cch = GetEnvironmentVariableA( "USER", rgch, sizeof( rgch ) );
++			if ( cch > 0 && cch < sizeof( rgch ) && !strchr( rgch, '/' ) )
++			{
++				strHome = std::string( "/home/" ) + rgch;
++				pchHomeFrom = "USER";
++			}
++		}
++		if ( strUnixDir.empty() )
++		{
++			if ( strHome.empty() )
++			{
++				*pstrDiag += " home=(not found)";
++				return std::wstring();
++			}
++			*pstrDiag += std::string( " home=" ) + strHome + " (from " + pchHomeFrom + ")";
++			strUnixDir = strHome + "/.local/share";
++		}
++		else
++			*pstrDiag += " XDG_DATA_HOME=" + strUnixDir;
++		*pstrUnixDir = strUnixDir;
++
++		typedef WCHAR *( CDECL *PFNWineGetDosFileName )( LPCSTR );
++		PFNWineGetDosFileName pfnToDos = (PFNWineGetDosFileName)GetProcAddress( GetModuleHandleW( L"kernel32.dll" ), "wine_get_dos_file_name" );
++		// Uses whatever drive letter this prefix maps the folder to (Proton maps Z: to /, but that can
++		// be changed), or \\?\unix\... when no drive covers it.
++		if ( WCHAR *pwchDos = pfnToDos ? pfnToDos( strUnixDir.c_str() ) : NULL )	// e.g. \\?\Z:\home\deck\.local\share
++		{
++			std::wstring wstrDir = pwchDos;
++			HeapFree( GetProcessHeap(), 0, pwchDos );
++			if ( wstrDir.size() > 6 && wstrDir.compare( 0, 4, L"\\\\?\\" ) == 0 && wstrDir[5] == L':' )
++				wstrDir.erase( 0, 4 );	// plain drive path; \\?\unix\... is kept as is
++			*pstrDiag += " path=wine_get_dos_file_name";
++			return wstrDir;
++		}
++
++		// Wine's own name for a Linux path, independent of drive letters
++		std::string strDos = "\\\\?\\unix" + strUnixDir;
++		std::replace( strDos.begin(), strDos.end(), '/', '\\' );
++		*pstrDiag += std::string( " path=\\\\?\\unix (wine_get_dos_file_name " ) + ( pfnToDos ? "failed" : "missing" ) + ")";
++		return UTF8ToWide( strDos );
++	}
++
++	struct DeviceIdResult_t
++	{
++		std::string m_strID;		// empty on failure
++		std::string m_strInfo;
++		std::wstring m_wstrPath;
++		std::string m_strShownPath;	// Linux path under Wine / Proton, else the Windows path
++		std::string m_strDiag;
++	};
++
++	// Creates the folder and any missing parents. Works with \\?\ paths (SHCreateDirectoryExW does not).
++	bool CreateDirectoryTree( const std::wstring &wstrDir )
++	{
++		if ( CreateDirectoryW( wstrDir.c_str(), NULL ) || GetLastError() == ERROR_ALREADY_EXISTS )
++			return true;
++		if ( GetLastError() != ERROR_PATH_NOT_FOUND )
++			return false;
++		size_t nSlash = wstrDir.find_last_of( L'\\' );
++		if ( nSlash == std::wstring::npos || nSlash == 0 || !CreateDirectoryTree( wstrDir.substr( 0, nSlash ) ) )
++			return false;
++		return CreateDirectoryW( wstrDir.c_str(), NULL ) || GetLastError() == ERROR_ALREADY_EXISTS;
++	}
++
++	DeviceIdResult_t LoadOrCreateDeviceId()
++	{
++		DeviceIdResult_t result;
++		const char *pchWhere = "Linux home via Wine/Proton";
++		std::string strUnixDir;
++		std::wstring wstrDir = LinuxDataDirViaWine( &strUnixDir, &result.m_strDiag );
++		if ( wstrDir.empty() )
++		{
++			pchWhere = "LocalAppData";
++			PWSTR pwchLocalAppData = NULL;
++			if ( SUCCEEDED( SHGetKnownFolderPath( FOLDERID_LocalAppData, 0, NULL, &pwchLocalAppData ) ) )
++				wstrDir = pwchLocalAppData;
++			CoTaskMemFree( pwchLocalAppData );
++		}
++		if ( wstrDir.empty() )
++		{
++			result.m_strInfo = "FAILED: no folder to store it in";
++			return result;
++		}
++		wstrDir = wstrDir + L"\\" + k_pwchDeviceIdFolder;
++		result.m_wstrPath = wstrDir + L"\\" + k_pwchDeviceIdFile;
++		result.m_strShownPath = strUnixDir.empty() ? WideToUTF8( result.m_wstrPath )
++			: strUnixDir + "/" + WideToUTF8( k_pwchDeviceIdFolder ) + "/" + WideToUTF8( k_pwchDeviceIdFile );
++
++		// 1. Already there: return it. Could not be read: give up rather than replace it
++		DWORD dwError = 0;
++		EDeviceIdFile eFile = ReadDeviceIdFile( result.m_wstrPath, &result.m_strID, &dwError );
++		if ( eFile == k_EDeviceIdFile_OK )
++		{
++			result.m_strInfo = std::string( "existing, " ) + pchWhere;
++			return result;
++		}
++		if ( eFile == k_EDeviceIdFile_Unreadable )
++		{
++			result.m_strInfo = "FAILED to read the existing file (error " + std::to_string( dwError ) + "), " + pchWhere;
++			return result;
++		}
++
++		// 2. Create it: write a temp file, then move it into place
++		bool bReplace = eFile == k_EDeviceIdFile_Invalid;
++		if ( !CreateDirectoryTree( wstrDir ) )
++		{
++			result.m_strInfo = "FAILED to create the folder (error " + std::to_string( GetLastError() ) + "), " + pchWhere;
++			return result;
++		}
++		std::string strNew = NewUUID();
++		if ( strNew.empty() )
++		{
++			result.m_strInfo = std::string( "FAILED to generate a UUID, " ) + pchWhere;
++			return result;
++		}
++		std::wstring wstrTemp = result.m_wstrPath + L"." + std::to_wstring( GetCurrentProcessId() ) + L".tmp";
++		HANDLE hFile = CreateFileW( wstrTemp.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
++		DWORD cbWritten = 0;
++		bool bWritten = hFile != INVALID_HANDLE_VALUE &&
++			WriteFile( hFile, strNew.c_str(), (DWORD)strNew.size(), &cbWritten, NULL ) && cbWritten == strNew.size() &&
++			FlushFileBuffers( hFile );
++		if ( !bWritten )
++			dwError = GetLastError();
++		if ( hFile != INVALID_HANDLE_VALUE )
++			CloseHandle( hFile );
++		bool bMoved = bWritten && MoveFileExW( wstrTemp.c_str(), result.m_wstrPath.c_str(), bReplace ? MOVEFILE_REPLACE_EXISTING : 0 );
++		if ( bWritten && !bMoved )
++			dwError = GetLastError();
++		DeleteFileW( wstrTemp.c_str() );	// already gone after a move
++
++		// Return what is on disk: another game may have created it first, or (when two games replace an
++		// invalid file at once) moved its own over ours. Both then use the same ID.
++		std::string strOnDisk;
++		DWORD dwReadError = 0;
++		if ( ReadDeviceIdFile( result.m_wstrPath, &strOnDisk, &dwReadError ) == k_EDeviceIdFile_OK )
++		{
++			result.m_strID = strOnDisk;
++			if ( !bMoved || strOnDisk != strNew )
++				result.m_strInfo = std::string( "existing (created by another process just now), " ) + pchWhere;
++			else
++				result.m_strInfo = std::string( bReplace ? "created (replaced an invalid file), " : "created, " ) + pchWhere;
++		}
++		else
++			result.m_strInfo = "FAILED to write (error " + std::to_string( dwError ? dwError : dwReadError ) + "), " + pchWhere;
++		return result;
++	}
++}
++#endif
++
++
++// If the overlay doesn't become active within this time, assume it isn't available.
++static const uint64 k_ulBrowserTestOpenTimeoutMS = 5000;
+ 
+ 
+ //-----------------------------------------------------------------------------
+@@ -35,6 +447,28 @@ public:
+ 		PushSelectedItem();
+ 		ClearMenuItems();
+ 
++		std::string strURL = m_pOverlayExamples->GetBrowserTestURL();
++#ifdef _WIN32
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Device ID] " + ( m_pOverlayExamples->GetDeviceId().empty() ? std::string( "-" ) : m_pOverlayExamples->GetDeviceId() ) +
++			" (" + m_pOverlayExamples->GetDeviceIdInfo() + ") - select to read again", { OverlayExample_t::k_EOverlayExampleItem_DeviceId_Reload, NULL } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Device ID] file: " + m_pOverlayExamples->GetDeviceIdPath(), { OverlayExample_t::k_EOverlayExampleItem_DeviceId_Reload, NULL } ) );
++		std::string strOvbPopup = std::to_string( m_pOverlayExamples->GetBridgeLastPopup() );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[OVB Bridge] Open popup - " + m_pOverlayExamples->GetBridgeURL() + "  (" + m_pOverlayExamples->GetBridgeStatus() + ")",
++			{ OverlayExample_t::k_EOverlayExampleItem_Ovb_Open, NULL } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[OVB Bridge] Send {cmd:'ping'} to popup " + strOvbPopup, { OverlayExample_t::k_EOverlayExampleItem_Ovb_Ping, NULL } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[OVB Bridge] Close popup " + strOvbPopup + " from the game", { OverlayExample_t::k_EOverlayExampleItem_Ovb_Close, NULL } ) );
++#endif
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Browser Test] Open Modal - " + strURL, { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenModal, NULL } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Browser Test] Open Default - " + strURL, { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenDefault, NULL } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Browser Test] Enter URL (Steam keyboard)", { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_EnterURL, NULL } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Multi Popup] Modal x2 at once", { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenMulti, "modal-now" } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Multi Popup] Modal, 2nd after 3s", { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenMulti, "modal-delay" } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Multi Popup] Default x2 at once", { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenMulti, "default-now" } ) );
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Multi Popup] Default, 2nd after 3s", { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenMulti, "default-delay" } ) );
++#ifdef _WIN32
++		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "[Browser Test] Paste URL from clipboard", { OverlayExample_t::k_EOverlayExampleItem_BrowserTest_PasteURL, NULL } ) );
++#endif
++
+ 		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "ActivateGameOverlay - Friends", { OverlayExample_t::k_EOverlayExampleItem_ActivateGameOverlay, "Friends" } ) );
+ 		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "ActivateGameOverlay - Community", { OverlayExample_t::k_EOverlayExampleItem_ActivateGameOverlay, "Community" } ) );
+ 		AddMenuItem( COverlayExamplesMenu::MenuItem_t( "ActivateGameOverlay - Settings", { OverlayExample_t::k_EOverlayExampleItem_ActivateGameOverlay, "Settings" } ) );
+@@ -97,6 +531,12 @@ COverlayExamples::COverlayExamples( IGameEngine *pGameEngine )
+ 	m_pMenu = new COverlayExamplesMenu( pGameEngine, this );
+ 	m_delayedCommand = { OverlayExample_t::k_EOverlayExampleItem_Invalid, NULL };
+ 
++	m_strBrowserTestURL = ReadFirstLine( k_pchBrowserTestURLFile, k_pchDefaultBrowserTestURL );
++	LogBrowserTest( "Browser test URL: %s", m_strBrowserTestURL.c_str() );
++
++	LoadDeviceId();
++	InitBridge();
++
+ 	Show();
+ }
+ 
+@@ -108,6 +548,9 @@ void COverlayExamples::RunFrame()
+ {
+ 	m_pMenu->RunFrame();
+ 
++	RunBrowserTestFrame();
++	DrawBrowserTestStatus();
++
+ 	if ( !m_pGameEngine->BIsKeyDown( VK_RETURN ) && !m_pGameEngine->BIsControllerActionActive( eControllerDigitalAction_MenuSelect ) )
+ 	{
+ 		switch ( m_delayedCommand.m_eItem )
+@@ -147,6 +590,57 @@ void COverlayExamples::RunFrame()
+ 			}
+ 			break;
+ 
++			case OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenModal:
++				StartBrowserTest( m_strBrowserTestURL.c_str(), k_EActivateGameOverlayToWebPageMode_Modal );
++				break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenDefault:
++				StartBrowserTest( m_strBrowserTestURL.c_str(), k_EActivateGameOverlayToWebPageMode_Default );
++				break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_BrowserTest_OpenMulti:
++				StartMultiPopupTest( m_delayedCommand.m_pchExtraCommandData );
++				break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_BrowserTest_EnterURL:
++			{
++				// Works on Steam Deck and in Big Picture mode. On the regular desktop client this
++				// returns false and no keyboard is shown.
++				bool bShown = SteamUtils()->ShowGamepadTextInput( k_EGamepadTextInputModeNormal, k_EGamepadTextInputLineModeSingleLine,
++					"Overlay browser test URL", 1000, m_strBrowserTestURL.c_str() );
++				m_bWaitingForURLInput = bShown;
++				LogBrowserTest( "ShowGamepadTextInput -> %s", bShown ? "true" : "false (not in Big Picture / Steam Deck?)" );
++			}
++			break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_BrowserTest_PasteURL:
++				PasteBrowserTestURLFromClipboard();
++				break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_DeviceId_Reload:
++				LoadDeviceId();
++				m_pMenu->Rebuild();
++				break;
++
++#ifdef _WIN32
++			case OverlayExample_t::k_EOverlayExampleItem_Ovb_Open:
++				OpenBridgePopup();
++				break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_Ovb_Ping:
++				if ( g_bOvbReady && m_unOvbLastPopup )
++				{
++					int nRC = g_Ovb.OVB_PostMessage( m_unOvbLastPopup, k_pchOvbMenuPing );
++					LogBrowserTest( "[OVB] NATIVE -> WEB popup %u: ping -> %d page(s)", m_unOvbLastPopup, nRC );
++				}
++				break;
++
++			case OverlayExample_t::k_EOverlayExampleItem_Ovb_Close:
++				if ( g_bOvbReady && m_unOvbLastPopup )
++					LogBrowserTest( "[OVB] OVB_Close( %u ) -> %d", m_unOvbLastPopup, g_Ovb.OVB_Close( m_unOvbLastPopup ) );
++				break;
++#endif
++
+ 			case OverlayExample_t::k_EOverlayExampleItem_ActivateGameOverlayToStore:
+ 			{
+ 				if ( !strcmp( m_delayedCommand.m_pchExtraCommandData, "addtocart" ) )
+@@ -287,3 +781,425 @@ void COverlayExamples::OnDoesGamePhaseRecordingExist( SteamTimelineGamePhaseReco
+ }
+ 
+ 
++
++
++//-----------------------------------------------------------------------------
++// Purpose: Overlay browser open/close detection test
++//
++// The Steam API has no "browser closed" callback. What it does give us is
++// GameOverlayActivated_t, which fires when the overlay takes / releases input focus.
++//
++//  - Modal mode:   the browser is the only thing shown in the overlay, and closing the
++//                  browser closes the overlay (and vice versa). So
++//                  GameOverlayActivated_t( m_bActive = false ) == browser closed.
++//  - Default mode: the browser is just another overlay window and stays open after the
++//                  overlay is hidden, so the same event only means "overlay hidden".
++//
++// In modal mode a page can also report back by navigating to spacewar://..., which
++// arrives as OverlayBrowserProtocolNavigation_t.
++//-----------------------------------------------------------------------------
++void COverlayExamples::StartBrowserTest( const char *pchURL, EActivateGameOverlayToWebPageMode eMode )
++{
++	if ( m_eBrowserTestState == k_EBrowserTestState_WaitingForOpen || m_eBrowserTestState == k_EBrowserTestState_Open )
++	{
++		LogBrowserTest( "Ignoring open request, browser test already in progress" );
++		return;
++	}
++
++	if ( !SteamUtils()->IsOverlayEnabled() )
++	{
++		// Not fatal: the overlay can still be injecting right after launch, so try anyway.
++		LogBrowserTest( "WARNING: SteamUtils()->IsOverlayEnabled() is false" );
++	}
++
++	if ( eMode == k_EActivateGameOverlayToWebPageMode_Modal )
++	{
++		bool bRegistered = SteamFriends()->RegisterProtocolInOverlayBrowser( k_pchBrowserTestProtocol );
++		LogBrowserTest( "RegisterProtocolInOverlayBrowser( \"%s\" ) -> %s", k_pchBrowserTestProtocol, bRegistered ? "true" : "false" );
++	}
++
++	m_eBrowserTestMode = eMode;
++	m_eBrowserTestState = k_EBrowserTestState_WaitingForOpen;
++	m_ulBrowserTestRequestTick = m_pGameEngine->GetGameTickCount();
++	m_ulBrowserTestOpenTick = 0;
++	m_ulBrowserTestCloseTick = 0;
++	m_bBrowserTestClosedByUser = false;
++	m_strBrowserTestLastProtocolURI.clear();
++
++	LogBrowserTest( "ActivateGameOverlayToWebPage( \"%s\", %s )", pchURL,
++		eMode == k_EActivateGameOverlayToWebPageMode_Modal ? "Modal" : "Default" );
++	SteamFriends()->ActivateGameOverlayToWebPage( pchURL, eMode );
++}
++
++
++void COverlayExamples::LoadDeviceId()
++{
++#ifdef _WIN32
++	DeviceIdResult_t result = LoadOrCreateDeviceId();
++	m_strDeviceId = result.m_strID;
++	m_strDeviceIdInfo = result.m_strInfo;
++	m_strDeviceIdPath = result.m_strShownPath;
++	LogBrowserTest( "[Device ID] checks: %s (Windows path: %s)", result.m_strDiag.c_str(), WideToUTF8( result.m_wstrPath ).c_str() );
++	LogBrowserTest( "[Device ID] %s (%s) file: %s", m_strDeviceId.empty() ? "-" : m_strDeviceId.c_str(), m_strDeviceIdInfo.c_str(), m_strDeviceIdPath.c_str() );
++#endif
++}
++
++
++void COverlayExamples::InitBridge()
++{
++#ifdef _WIN32
++	m_strOvbURL = ReadFirstLine( k_pchOvbURLFile, k_pchOvbDefaultURL );
++
++	if ( !OVB_LoadApi( &g_Ovb, NULL ) )
++	{
++		m_strOvbStatus = "OFF: overlay_bridge.dll not found";
++		LogBrowserTest( "[OVB] %s", m_strOvbStatus.c_str() );
++		return;
++	}
++	OVB_Config config = {};
++	config.structSize = sizeof( config );
++	config.allowedOrigins = k_rgpchOvbOrigins;
++	config.allowedOriginCount = sizeof( k_rgpchOvbOrigins ) / sizeof( k_rgpchOvbOrigins[0] );
++	config.onMessage = OnOvbMessage;
++	config.onClosed = OnOvbClosed;
++	config.onOpened = OnOvbOpened;
++	config.user = this;
++	int nRC = g_Ovb.OVB_Init( &config );
++	g_bOvbReady = nRC == OVB_BRIDGE_OK;
++	m_strOvbStatus = g_bOvbReady ? "ready" : "OFF: OVB_Init failed (" + std::to_string( nRC ) + ")";
++	LogBrowserTest( "[OVB] DLL loaded, OVB_Init -> %d (main thread %lu)", nRC, GetCurrentThreadId() );
++#endif
++}
++
++
++void COverlayExamples::OpenBridgePopup()
++{
++#ifdef _WIN32
++	if ( !g_bOvbReady )
++	{
++		LogBrowserTest( "[OVB] not available: %s", m_strOvbStatus.c_str() );
++		return;
++	}
++	uint32_t unPopupId = 0;
++	int nRC = g_Ovb.OVB_OpenUrl( m_strOvbURL.c_str(), &unPopupId );
++	LogBrowserTest( "[OVB] OVB_OpenUrl( \"%s\" ) -> %d, popup %u", m_strOvbURL.c_str(), nRC, unPopupId );
++	if ( nRC == OVB_BRIDGE_OK )
++	{
++		m_unOvbLastPopup = unPopupId;
++		RefreshBridgeStatus();
++	}
++	else
++	{
++		// No last popup any more, so the per-frame status refresh does not hide this error
++		m_unOvbLastPopup = 0;
++		if ( nRC == OVB_BRIDGE_ERR_OVERLAY_DISABLED )
++			m_strOvbStatus = "Steam overlay is off: turn it on in Steam settings (or wait a few seconds after start)";
++		else
++			m_strOvbStatus = nRC == OVB_BRIDGE_ERR_OVERLAY ? "OFF: no Steam overlay" : "open failed (" + std::to_string( nRC ) + ")";
++	}
++	m_pMenu->Rebuild();
++#endif
++}
++
++
++// Status of the last popup, shown in the menu
++void COverlayExamples::RefreshBridgeStatus()
++{
++#ifdef _WIN32
++	if ( !g_bOvbReady || !m_unOvbLastPopup )
++		return;
++	OVB_PopupInfo info = {};
++	info.structSize = sizeof( info );
++	if ( g_Ovb.OVB_GetPopupInfo( m_unOvbLastPopup, &info ) != OVB_BRIDGE_OK )
++		return;
++	static const char *s_rgpchState[] = { "?", "waiting", "open", "closed" };
++	std::string strStatus = "popup " + std::to_string( m_unOvbLastPopup ) + ": " + s_rgpchState[info.state <= 3 ? info.state : 0];
++	if ( info.state == OVB_POPUP_CLOSED )
++		strStatus += std::string( " " ) + OvbReasonName( (int)info.closeReason );
++	if ( strStatus != m_strOvbStatus )
++	{
++		m_strOvbStatus = strStatus;
++		m_pMenu->Rebuild();
++	}
++#endif
++}
++
++
++void COverlayExamples::UpdateBridge()
++{
++#ifdef _WIN32
++	if ( !g_bOvbReady )
++		return;
++	g_Ovb.OVB_Update();
++	RefreshBridgeStatus();
++#endif
++}
++
++
++void COverlayExamples::ShutdownBridge()
++{
++#ifdef _WIN32
++	if ( !g_Ovb.module )
++		return;
++	if ( g_bOvbReady )
++		g_Ovb.OVB_Shutdown();
++	g_bOvbReady = false;
++	OVB_UnloadApi( &g_Ovb );
++	LogBrowserTest( "[OVB] shut down" );
++#endif
++}
++
++
++void COverlayExamples::RunBrowserTestFrame()
++{
++	// The game keeps running while the overlay has focus, so this fires while popup #1 is showing
++	if ( m_ulSecondPopupDueTick != 0 && m_pGameEngine->GetGameTickCount() >= m_ulSecondPopupDueTick )
++	{
++		m_ulSecondPopupDueTick = 0;
++		std::string strURL = MakePopupURL( 2 );
++		LogBrowserTest( "[Multi] popup #2 (state=%d): ActivateGameOverlayToWebPage( \"%s\" )", (int)m_eBrowserTestState, strURL.c_str() );
++		SteamFriends()->ActivateGameOverlayToWebPage( strURL.c_str(), m_eBrowserTestMode );
++	}
++
++	if ( m_eBrowserTestState != k_EBrowserTestState_WaitingForOpen )
++		return;
++
++	if ( m_pGameEngine->GetGameTickCount() - m_ulBrowserTestRequestTick > k_ulBrowserTestOpenTimeoutMS )
++	{
++		m_eBrowserTestState = k_EBrowserTestState_FailedToOpen;
++		LogBrowserTest( "FAILED: overlay did not activate within %llu ms (overlay disabled or not injected?)",
++			(unsigned long long)k_ulBrowserTestOpenTimeoutMS );
++	}
++}
++
++
++void COverlayExamples::OnGameOverlayActivated( GameOverlayActivated_t *pCallback )
++{
++	LogBrowserTest( "GameOverlayActivated_t: active=%d userInitiated=%d appID=%u",
++		(int)pCallback->m_bActive, (int)pCallback->m_bUserInitiated, pCallback->m_nAppID );
++
++	uint64 ulNow = m_pGameEngine->GetGameTickCount();
++
++	if ( pCallback->m_bActive )
++	{
++		if ( m_eBrowserTestState == k_EBrowserTestState_WaitingForOpen || m_eBrowserTestState == k_EBrowserTestState_FailedToOpen )
++		{
++			m_eBrowserTestState = k_EBrowserTestState_Open;
++			m_ulBrowserTestOpenTick = ulNow;
++			LogBrowserTest( "BROWSER OPENED (%llu ms after request)", (unsigned long long)( ulNow - m_ulBrowserTestRequestTick ) );
++		}
++	}
++	else
++	{
++		if ( m_eBrowserTestState == k_EBrowserTestState_Open )
++		{
++			m_eBrowserTestState = k_EBrowserTestState_Closed;
++			m_ulBrowserTestCloseTick = ulNow;
++			m_bBrowserTestClosedByUser = pCallback->m_bUserInitiated;
++			LogBrowserTest( "%s (open for %llu ms, userInitiated=%d)",
++				m_eBrowserTestMode == k_EActivateGameOverlayToWebPageMode_Modal ? "BROWSER CLOSED" : "OVERLAY HIDDEN (browser window may still be open)",
++				(unsigned long long)( ulNow - m_ulBrowserTestOpenTick ), (int)pCallback->m_bUserInitiated );
++		}
++	}
++}
++
++
++void COverlayExamples::OnOverlayBrowserProtocolNavigation( OverlayBrowserProtocolNavigation_t *pCallback )
++{
++	m_strBrowserTestLastProtocolURI = pCallback->rgchURI;
++	LogBrowserTest( "OverlayBrowserProtocolNavigation_t: %s", pCallback->rgchURI );
++}
++
++
++void COverlayExamples::DrawBrowserTestStatus()
++{
++	const char *pchState = "Idle";
++	DWORD dwColor = D3DCOLOR_ARGB( 255, 200, 200, 200 );
++	switch ( m_eBrowserTestState )
++	{
++	case k_EBrowserTestState_WaitingForOpen:	pchState = "Waiting for overlay...";	dwColor = D3DCOLOR_ARGB( 255, 255, 255, 0 ); break;
++	case k_EBrowserTestState_Open:				pchState = "OPEN";						dwColor = D3DCOLOR_ARGB( 255, 25, 200, 25 ); break;
++	case k_EBrowserTestState_Closed:			pchState = m_eBrowserTestMode == k_EActivateGameOverlayToWebPageMode_Modal ? "CLOSED" : "OVERLAY HIDDEN";
++												dwColor = D3DCOLOR_ARGB( 255, 255, 128, 0 ); break;
++	case k_EBrowserTestState_FailedToOpen:		pchState = "FAILED TO OPEN";			dwColor = D3DCOLOR_ARGB( 255, 255, 64, 64 ); break;
++	default: break;
++	}
++
++	char rgchLine1[512];
++	char rgchLine2[1200];
++	sprintf_safe( rgchLine1, "Browser test [%s]: %s   overlayEnabled=%d",
++		m_eBrowserTestMode == k_EActivateGameOverlayToWebPageMode_Modal ? "Modal" : "Default",
++		pchState, (int)SteamUtils()->IsOverlayEnabled() );
++
++	if ( m_eBrowserTestState == k_EBrowserTestState_Closed )
++	{
++		sprintf_safe( rgchLine2, "open %llu ms, closed by user=%d   protocol nav: %s",
++			(unsigned long long)( m_ulBrowserTestCloseTick - m_ulBrowserTestOpenTick ), (int)m_bBrowserTestClosedByUser,
++			m_strBrowserTestLastProtocolURI.empty() ? "-" : m_strBrowserTestLastProtocolURI.c_str() );
++	}
++	else
++	{
++		sprintf_safe( rgchLine2, "protocol nav: %s   (log: %s)",
++			m_strBrowserTestLastProtocolURI.empty() ? "-" : m_strBrowserTestLastProtocolURI.c_str(), k_pchBrowserTestLogFile );
++	}
++
++	const int32 nLineHeight = MENU_FONT_HEIGHT + MENU_ITEM_PADDING;
++	RECT rect;
++	rect.left = 10;
++	rect.right = m_pGameEngine->GetViewportWidth() - 10;
++	rect.bottom = m_pGameEngine->GetViewportHeight() - 10;
++	rect.top = rect.bottom - nLineHeight;
++	m_pGameEngine->BDrawString( g_hMenuFont, rect, D3DCOLOR_ARGB( 255, 200, 200, 200 ), TEXTPOS_LEFT|TEXTPOS_VCENTER, rgchLine2 );
++	rect.bottom = rect.top;
++	rect.top = rect.bottom - nLineHeight;
++	m_pGameEngine->BDrawString( g_hMenuFont, rect, dwColor, TEXTPOS_LEFT|TEXTPOS_VCENTER, rgchLine1 );
++}
++
++
++void COverlayExamples::LogBrowserTest( const char *pchFormat, ... )
++{
++	char rgchMessage[2048];
++	va_list args;
++	va_start( args, pchFormat );
++	vsnprintf( rgchMessage, sizeof( rgchMessage ), pchFormat, args );
++	va_end( args );
++
++	char rgchLine[2200];
++	sprintf_safe( rgchLine, "[OverlayBrowserTest %llu] %s\n", (unsigned long long)m_pGameEngine->GetGameTickCount(), rgchMessage );
++
++	OutputDebugString( rgchLine );
++	printf( "%s", rgchLine );
++	fflush( stdout );
++
++	if ( FILE *file = fopen( k_pchBrowserTestLogFile, "at" ) )
++	{
++		fputs( rgchLine, file );
++		fclose( file );
++	}
++}
++
++
++//-----------------------------------------------------------------------------
++// Purpose: Changes the test URL and remembers it in overlay_test_url.txt
++//-----------------------------------------------------------------------------
++void COverlayExamples::SetBrowserTestURL( const std::string &strURL )
++{
++	std::string strTrimmed = strURL;
++	strTrimmed.erase( strTrimmed.find_last_not_of( " \t\r\n" ) + 1 );
++	strTrimmed.erase( 0, strTrimmed.find_first_not_of( " \t\r\n" ) );
++	if ( strTrimmed.empty() )
++	{
++		LogBrowserTest( "Ignoring empty URL" );
++		return;
++	}
++
++	m_strBrowserTestURL = strTrimmed;
++	LogBrowserTest( "Browser test URL set to: %s", m_strBrowserTestURL.c_str() );
++
++	if ( FILE *file = fopen( k_pchBrowserTestURLFile, "wt" ) )
++	{
++		fprintf( file, "%s\n", m_strBrowserTestURL.c_str() );
++		fclose( file );
++	}
++
++	m_pMenu->Rebuild();
++}
++
++
++void COverlayExamples::OnGamepadTextInputDismissed( GamepadTextInputDismissed_t *pCallback )
++{
++	if ( !m_bWaitingForURLInput )
++		return;
++	m_bWaitingForURLInput = false;
++
++	if ( !pCallback->m_bSubmitted )
++	{
++		LogBrowserTest( "URL input cancelled" );
++		return;
++	}
++
++	char rgchURL[1024] = {};
++	if ( SteamUtils()->GetEnteredGamepadTextInput( rgchURL, sizeof( rgchURL ) ) )
++		SetBrowserTestURL( rgchURL );
++}
++
++
++void COverlayExamples::PasteBrowserTestURLFromClipboard()
++{
++#ifdef _WIN32
++	if ( !OpenClipboard( NULL ) )
++	{
++		LogBrowserTest( "OpenClipboard failed" );
++		return;
++	}
++
++	std::string strURL;
++	if ( HANDLE hData = GetClipboardData( CF_UNICODETEXT ) )
++	{
++		if ( const wchar_t *pwchText = (const wchar_t *)GlobalLock( hData ) )
++		{
++			strURL = WideToUTF8( pwchText );
++			GlobalUnlock( hData );
++		}
++	}
++	CloseClipboard();
++
++	// only take the first line
++	size_t iNewline = strURL.find_first_of( "\r\n" );
++	if ( iNewline != std::string::npos )
++		strURL.erase( iNewline );
++
++	if ( strURL.empty() )
++		LogBrowserTest( "Clipboard has no text" );
++	else
++		SetBrowserTestURL( strURL );
++#endif
++}
++
++
++//-----------------------------------------------------------------------------
++// Purpose: Checks whether the overlay can show more than one web popup.
++//	"-now":   both calls in the same frame
++//	"-delay": popup #2 is requested 3s later, while popup #1 is (hopefully) still open
++// Watch whether #2 replaces #1, opens beside it, or is ignored, and how many
++// GameOverlayActivated_t events arrive (see overlay_browser_test.log).
++//-----------------------------------------------------------------------------
++void COverlayExamples::StartMultiPopupTest( const char *pchVariant )
++{
++	EActivateGameOverlayToWebPageMode eMode = strncmp( pchVariant, "modal", 5 ) == 0
++		? k_EActivateGameOverlayToWebPageMode_Modal : k_EActivateGameOverlayToWebPageMode_Default;
++	bool bDelay = strstr( pchVariant, "delay" ) != NULL;
++
++	LogBrowserTest( "[Multi] ---- start %s ----", pchVariant );
++	m_ulSecondPopupDueTick = 0;
++	StartBrowserTest( MakePopupURL( 1 ).c_str(), eMode );
++	if ( m_eBrowserTestState != k_EBrowserTestState_WaitingForOpen )
++		return;	// popup #1 was not requested
++
++	if ( bDelay )
++	{
++		m_ulSecondPopupDueTick = m_pGameEngine->GetGameTickCount() + 3000;
++	}
++	else
++	{
++		std::string strURL = MakePopupURL( 2 );
++		LogBrowserTest( "[Multi] popup #2: ActivateGameOverlayToWebPage( \"%s\" )", strURL.c_str() );
++		SteamFriends()->ActivateGameOverlayToWebPage( strURL.c_str(), eMode );
++	}
++}
++
++
++std::string COverlayExamples::MakePopupURL( int nPopup ) const
++{
++	std::string strURL = m_strBrowserTestURL;
++	size_t iFragment = strURL.find( '#' );
++	std::string strFragment;
++	if ( iFragment != std::string::npos )
++	{
++		strFragment = strURL.substr( iFragment );
++		strURL.erase( iFragment );
++	}
++	strURL += ( strURL.find( '?' ) == std::string::npos ) ? "?" : "&";
++	strURL += "popup=" + std::to_string( nPopup );
++	return strURL + strFragment;
++}
+diff --git a/sdk/steamworksexample/OverlayExamples.h b/sdk/steamworksexample/OverlayExamples.h
+index 635bb0c..8a6dc4c 100644
+--- a/sdk/steamworksexample/OverlayExamples.h
++++ b/sdk/steamworksexample/OverlayExamples.h
+@@ -33,6 +33,22 @@ public:
+ 	bool BHasLastGamePhase() const { return !m_strLastGamePhaseIDToShow.empty();  }
+ 	bool BHasLastTimelineEvent() const { return m_ulLastCrashIntoSunEventIDToShow != 0; }
+ 
++	const std::string &GetBrowserTestURL() const { return m_strBrowserTestURL; }
++
++	// OverlayBridge overlay bridge (native_bridge, overlay_bridge.dll loaded at run time).
++	// UpdateBridge: every frame from CSpaceWarClient::RunFrame. ShutdownBridge: before SteamAPI_Shutdown.
++	void UpdateBridge();
++	void ShutdownBridge();
++	const std::string &GetBridgeStatus() const { return m_strOvbStatus; }
++	const std::string &GetBridgeURL() const { return m_strOvbURL; }
++	uint32 GetBridgeLastPopup() const { return m_unOvbLastPopup; }
++	void LogBrowserTest( const char *pchFormat, ... );	// also used by the bridge callbacks
++
++	// Device ID shared by every game on this machine (see LoadOrCreateDeviceId in the .cpp)
++	const std::string &GetDeviceId() const { return m_strDeviceId; }
++	const std::string &GetDeviceIdInfo() const { return m_strDeviceIdInfo; }
++	const std::string &GetDeviceIdPath() const { return m_strDeviceIdPath; }
++
+ private:	
+ 	
+ 	// Engine
+@@ -43,6 +59,54 @@ private:
+ 	std::string m_strLastGamePhaseIDToShow;
+ 	uint64 m_ulLastCrashIntoSunEventIDToShow = 0;
+ 
++	// --- Overlay browser open/close detection test ---
++	enum EBrowserTestState
++	{
++		k_EBrowserTestState_Idle,
++		k_EBrowserTestState_WaitingForOpen,	// ActivateGameOverlayToWebPage called, overlay not active yet
++		k_EBrowserTestState_Open,			// GameOverlayActivated_t( active ) received
++		k_EBrowserTestState_Closed,			// GameOverlayActivated_t( inactive ) received
++		k_EBrowserTestState_FailedToOpen,	// overlay never became active (disabled / not injected)
++	};
++
++	void StartBrowserTest( const char *pchURL, EActivateGameOverlayToWebPageMode eMode );
++	void RunBrowserTestFrame();
++	void DrawBrowserTestStatus();
++	void SetBrowserTestURL( const std::string &strURL );
++	void PasteBrowserTestURLFromClipboard();
++
++	// Multiple popup test: opens popup #1, then popup #2 either right away or while #1 is still showing
++	void StartMultiPopupTest( const char *pchVariant );
++	std::string MakePopupURL( int nPopup ) const;
++	uint64 m_ulSecondPopupDueTick = 0;	// 0 = no second popup pending
++
++	void LoadDeviceId();
++	std::string m_strDeviceId;
++	std::string m_strDeviceIdInfo;	// "existing" / "created" + where it is stored
++	std::string m_strDeviceIdPath;
++
++	void InitBridge();
++	void OpenBridgePopup();
++	void RefreshBridgeStatus();
++	std::string m_strOvbURL;
++	std::string m_strOvbStatus;
++	uint32 m_unOvbLastPopup = 0;
++
++	bool m_bWaitingForURLInput = false;
++	STEAM_CALLBACK( COverlayExamples, OnGamepadTextInputDismissed, GamepadTextInputDismissed_t );
++
++	std::string m_strBrowserTestURL;
++	EBrowserTestState m_eBrowserTestState = k_EBrowserTestState_Idle;
++	EActivateGameOverlayToWebPageMode m_eBrowserTestMode = k_EActivateGameOverlayToWebPageMode_Modal;
++	uint64 m_ulBrowserTestRequestTick = 0;
++	uint64 m_ulBrowserTestOpenTick = 0;
++	uint64 m_ulBrowserTestCloseTick = 0;
++	bool m_bBrowserTestClosedByUser = false;
++	std::string m_strBrowserTestLastProtocolURI;
++
++	STEAM_CALLBACK( COverlayExamples, OnGameOverlayActivated, GameOverlayActivated_t );
++	STEAM_CALLBACK( COverlayExamples, OnOverlayBrowserProtocolNavigation, OverlayBrowserProtocolNavigation_t );
++
+ 	STEAM_CALLBACK( COverlayExamples, OnScreenshotRequested, ScreenshotRequested_t );
+ 	STEAM_CALLBACK( COverlayExamples, OnSteamScreenshotReady, ScreenshotReady_t );
+ 
+diff --git a/sdk/steamworksexample/SpaceWarClient.cpp b/sdk/steamworksexample/SpaceWarClient.cpp
+index 51e171e..5e6523b 100644
+--- a/sdk/steamworksexample/SpaceWarClient.cpp
++++ b/sdk/steamworksexample/SpaceWarClient.cpp
+@@ -190,6 +190,7 @@ void CSpaceWarClient::Init( IGameEngine *pGameEngine )
+ //-----------------------------------------------------------------------------
+ CSpaceWarClient::~CSpaceWarClient()
+ {
++	m_pOverlayExamples->ShutdownBridge();	// before SteamAPI_Shutdown
+ 	DisconnectFromServer();
+ 
+ 	if ( m_pP2PAuthedGame )
+@@ -1419,6 +1420,9 @@ void CSpaceWarClient::RunFrame()
+ 	// Get any new data off the network to begin with
+ 	ReceiveNetworkData();
+ 
++	// OverlayBridge overlay bridge: child popups and callbacks run here, on the main thread
++	m_pOverlayExamples->UpdateBridge();
++
+ 	RenderTimer();
+ 
+ 	if ( m_eConnectedStatus != k_EClientNotConnected && m_pGameEngine->GetGameTickCount() - m_ulLastNetworkDataReceivedTime > MILLISECONDS_CONNECTION_TIMEOUT )
+diff --git a/sdk/steamworksexample/SpaceWarClient.h b/sdk/steamworksexample/SpaceWarClient.h
+index bb2a4ab..76e39f4 100644
+--- a/sdk/steamworksexample/SpaceWarClient.h
++++ b/sdk/steamworksexample/SpaceWarClient.h
+@@ -151,6 +151,15 @@ struct OverlayExample_t
+ 		k_EOverlayExampleItem_Notification_SetPosition,
+ 		k_EOverlayExampleItem_Timeline_OpenOverlayToTimelineEvent,
+ 		k_EOverlayExampleItem_Timeline_OpenOverlayToGamePhase,
++		k_EOverlayExampleItem_BrowserTest_OpenModal,
++		k_EOverlayExampleItem_BrowserTest_OpenDefault,
++		k_EOverlayExampleItem_BrowserTest_EnterURL,
++		k_EOverlayExampleItem_BrowserTest_PasteURL,
++		k_EOverlayExampleItem_BrowserTest_OpenMulti,
++		k_EOverlayExampleItem_Ovb_Open,
++		k_EOverlayExampleItem_Ovb_Ping,
++		k_EOverlayExampleItem_Ovb_Close,
++		k_EOverlayExampleItem_DeviceId_Reload,
+ 	};
+ 
+ 	EOverlayExampleItem m_eItem;
+diff --git a/sdk/steamworksexample/gameenginewin32.cpp b/sdk/steamworksexample/gameenginewin32.cpp
+index 7bd6805..87c7597 100644
+--- a/sdk/steamworksexample/gameenginewin32.cpp
++++ b/sdk/steamworksexample/gameenginewin32.cpp
+@@ -1876,16 +1876,17 @@ bool CGameEngineWin32::BDrawString( HGAMEFONT hFont, RECT rect, DWORD dwColor, D
+ //-----------------------------------------------------------------------------
+ void CGameEngineWin32::MessagePump()
+ {
++	// Pump every message on this thread, not just m_hWnd's: filtering by window leaves messages for
++	// other thread-owned windows (IME, Steam overlay) unprocessed, and the blocking GetMessage after
++	// a PM_NOREMOVE peek caused multi-second stalls (lost/late key presses).
+ 	MSG msg;
+-	BOOL bRet;
+-	while( PeekMessage( &msg, m_hWnd, 0, 0, PM_NOREMOVE ) )
++	while( PeekMessage( &msg, NULL, 0, 0, PM_REMOVE ) )
+ 	{
+-		bRet = GetMessage( &msg, m_hWnd, 0, 0 );
+-		if( bRet != 0 && bRet != -1 )
+-		{
+-			TranslateMessage(&msg);
+-			DispatchMessage(&msg);
+-		}
++		if ( msg.message == WM_QUIT )
++			continue;	// WM_DESTROY already started Shutdown()
++
++		TranslateMessage(&msg);
++		DispatchMessage(&msg);
+ 	}
+ }
+ 

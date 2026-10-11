@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overlay Popup Test</title>
+<script>
+  // TEST-ONLY diagnostics (loaded before overlay-bridge.js): report every /closing attempt
+  // and its outcome to this page's own server, so close notices can be traced on the real overlay.
+  (function () {
+    var beacon = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
+    function diag(msg) {
+      if (beacon) { beacon('/log?popup=diag&msg=' + encodeURIComponent(msg)); }
+    }
+    window.__diag = diag;
+    if (beacon) {
+      navigator.sendBeacon = function (url, data) {
+        var ok = beacon(url, data);
+        if (String(url).indexOf('/closing') >= 0) { diag('beacon /closing -> ' + ok + ' ' + String(data).slice(0, 90)); }
+        return ok;
+      };
+    }
+    var realFetch = window.fetch && window.fetch.bind(window);
+    if (realFetch) {
+      window.fetch = function (url, opts) {
+        var p = realFetch(url, opts);
+        if (String(url).indexOf('/closing') >= 0) {
+          diag('fetch /closing sent ' + String(opts && opts.body).slice(0, 90));
+          p.then(function (r) { diag('fetch /closing -> ' + r.status); }, function (e) { diag('fetch /closing failed: ' + e); });
+        }
+        return p;
+      };
+    }
+  })();
+</script>
+<script src="overlay-bridge.js?v=0.7.4"></script>
+<!-- included twice on purpose: must initialize once -->
+<script src="overlay-bridge.js?v=0.7.4"></script>
+<script>
+  window.__diag('bridge ' + OverlayBridge.version + ' env=' + OverlayBridge.getEnvironment() +
+    ' closeWrapped=' + (String(window.close).indexOf('[native code]') < 0));
+</script>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 24px; font: 18px/1.5 system-ui, sans-serif; background: #1b2838; color: #e6edf3; }
+  h1 { margin: 0 0 4px; font-size: 32px; }
+  .popup { font-size: 64px; font-weight: 700; color: #66c0f4; }
+  button { display: block; width: 100%; max-width: 520px; margin: 10px 0; padding: 14px; font-size: 18px;
+           background: #2a475e; color: #fff; border: 1px solid #66c0f4; border-radius: 6px; cursor: pointer; }
+  button:focus, button:hover { background: #3d6c8d; }
+  pre { background: #0e1621; padding: 12px; border-radius: 6px; white-space: pre-wrap; font-size: 14px; }
+</style>
+</head>
+<body>
+  <h1>Overlay Popup Test</h1>
+  <div class="popup">Popup #<span id="n">?</span></div>
+  <div id="info"></div>
+
+  <p>Bridge: <b id="bridge">-</b></p>
+  <button onclick="sendToNative()">0. OverlayBridge.postMessage({cmd:'button-click'}) → native</button>
+  <button onclick="tryClose()">1. window.close()</button>
+  <button onclick="OverlayBridge.closePopup('purchase-done')">1b. OverlayBridge.closePopup('purchase-done')</button>
+  <button onclick="go('spacewar://close?popup=' + n)">2. spacewar://close (game gets callback, Modal only)</button>
+  <button onclick="go('steam://gamewebcallback/close?popup=' + n)">3. steam://gamewebcallback/close</button>
+  <button onclick="openAnother()">4. window.open() another popup</button>
+  <button onclick="location.href = withPopup(num + 100)">5. Navigate this popup to #<span id="n100"></span></button>
+
+  <pre id="log"></pre>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const n = params.get('popup') || '?';
+  const num = isNaN(n) ? 0 : Number(n);   // opened without ?popup= (e.g. by the OVB menu): children count from 0
+  document.getElementById('n').textContent = n;
+  document.getElementById('n100').textContent = num + 100;
+  document.title = 'Popup #' + n;
+
+  function log(msg) {
+    document.getElementById('log').textContent += new Date().toLocaleTimeString() + '  ' + msg + '\n';
+    // Mirror to the serving host's access log so results can be read without seeing the screen
+    const url = '/log?popup=' + encodeURIComponent(n) + '&msg=' + encodeURIComponent(msg);
+    if (!navigator.sendBeacon || !navigator.sendBeacon(url)) fetch(url).catch(() => {});
+  }
+  function withPopup(p) {
+    const u = new URL(location.href);
+    u.searchParams.set('popup', p);
+    return u.toString();
+  }
+  function tryClose() {
+    log('window.close()');
+    window.close();
+    setTimeout(() => log('still here after window.close() -> not allowed'), 500);
+  }
+  function go(url) {
+    log('navigate: ' + url);
+    location.href = url;
+    setTimeout(() => log('still here after navigation (blocked or handled by game)'), 1000);
+  }
+  function openAnother() {
+    const w = window.open(withPopup(num + 10), '_blank');
+    log('window.open -> ' + (w ? 'window object returned' : 'null (blocked)'));
+  }
+
+  // --- OverlayBridge (overlay-bridge.js): same calls as window.chrome.webview ---
+  let sendCount = 0;
+  function sendToNative() {
+    sendCount++;
+    const msg = { cmd: 'button-click', count: sendCount, at: new Date().toISOString() };
+    OverlayBridge.postMessage(msg).then(ok => log('postMessage ' + JSON.stringify(msg) + ' -> ' + ok));
+  }
+  OverlayBridge.addEventListener('message', e => {
+    log('from native: ' + JSON.stringify(e.data));
+    if (e.data && e.data.cmd === 'ping') OverlayBridge.postMessage({ cmd: 'pong', echo: e.data });
+  });
+  OverlayBridge.addEventListener('close', () => log('native asked to close'));
+  setInterval(() => {
+    document.getElementById('bridge').textContent = OverlayBridge.getEnvironment() + ' / ' + (OverlayBridge.isAvailable() ? 'connected' : 'not connected') +
+      ' / canOpenPopup=' + OverlayBridge.canOpenPopup();
+  }, 300);
+
+  document.getElementById('info').textContent =
+    'UA: ' + navigator.userAgent + '  |  ' + innerWidth + 'x' + innerHeight;
+  window.addEventListener('beforeunload', () => log('beforeunload'));
+  window.addEventListener('pagehide', () => log('pagehide'));
+  document.addEventListener('visibilitychange', () => log('visibility: ' + document.visibilityState));
+  log('loaded');
+</script>
+</body>
+</html>

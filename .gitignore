@@ -1,0 +1,19 @@
+# Third-party code is not in this repository: setup.ps1 recreates it.
+#   sdk/          Steamworks SDK 1.62 (Valve) + patches/spacewar.patch
+#   third_party/  Microsoft.DXSDK.D3DX NuGet package (Microsoft)
+/sdk/
+/third_party/
+
+# Build outputs
+/bin/
+/native_bridge/out/
+/tests/webview2/bin/
+/tests/webview2/obj/
+/tests/frameworks/apps/*/dist/
+
+# Dependencies, caches, logs
+node_modules/
+__pycache__/
+*.log
+.vs/
+.claude/
